@@ -11,6 +11,12 @@ const DSH_VERSION = "0.2.0-rc.1";
 const BODY_LIMIT = 1024 * 1024;
 const HISTORY_DEFAULT_MAX_MESSAGES = 20;
 const HISTORY_MAX_MESSAGES = 50;
+const NATIVE_PROVIDER_MODES = [{
+  api: "google-generative-ai",
+  provider: "google",
+  displayName: "Gemini",
+  baseURL: "https://generativelanguage.googleapis.com/v1beta",
+}] as const;
 
 export const name = "riko-app-api";
 export const inject = ["webServer", "sessionController", "settings", "credentials", "llm"];
@@ -275,11 +281,25 @@ async function dispatch(
   }
   if (route === "/model-settings/discover" && req.method === "POST") {
     const body = await readJson(req);
-    const baseURL = requiredString(body.baseURL, "baseURL", 2048).trim();
     const api = requiredString(body.api, "api", 100);
+    const nativeMode = NATIVE_PROVIDER_MODES.find((item) => item.api === api);
+    if (nativeMode) {
+      const requestedProvider = optionalString(body.provider, 100)?.trim();
+      if (requestedProvider !== undefined && requestedProvider !== nativeMode.provider) {
+        throw new ApiFault(400, "INVALID_FIELD", "原生 Gemini 模式必须使用 DSH 的 google 提供商");
+      }
+      try {
+        const found = await llm.discoverModels("llm-pi-ai", { provider: nativeMode.provider });
+        sendJson(res, 200, { models: found.map(projectDiscoveredModel).filter(Boolean) });
+      } catch {
+        throw new ApiFault(502, "MODEL_DISCOVERY_FAILED", "无法读取 DSH 内置 Gemini 模型目录");
+      }
+      return;
+    }
     if (!supportedProtocols().includes(api)) {
       throw new ApiFault(400, "INVALID_FIELD", "不支持此模型 API 协议");
     }
+    const baseURL = requiredString(body.baseURL, "baseURL", 2048).trim();
     const apiKey = optionalString(body.apiKey, 8192)?.trim();
     try {
       const found = await llm.discoverModels("llm-pi-ai", {
@@ -539,7 +559,8 @@ async function describeModelSettings(
       name: view.displayName ?? entry.displayName,
       active: registered.some((item) => item.id === entry.provider),
       configurable: Boolean(entry.settingsNs),
-      custom: entry.settingsNs === "llm-pi-ai" && entry.declared === true,
+      custom: entry.settingsNs === "llm-pi-ai"
+        && (entry.declared === true || (profile !== undefined && isNativeCatalogProvider(entry))),
       configured: profile !== undefined,
       credentialRef: reference,
       keyConfigured,
@@ -552,6 +573,8 @@ async function describeModelSettings(
     writable: settings.writable,
     revision: piNamespace?.revision ?? 0,
     protocols: supportedProtocols(),
+    nativeProviders: NATIVE_PROVIDER_MODES.filter((mode) =>
+      directory.some((entry) => entry.provider === mode.provider && isNativeCatalogProvider(entry))),
     providers,
   };
 }
@@ -640,19 +663,44 @@ async function writeCustomProvider(
     || parsedURL.username.length > 0 || parsedURL.password.length > 0) {
     throw new ApiFault(400, "INVALID_FIELD", "API 地址必须是 HTTP(S) URL，且不能嵌入账号或密钥");
   }
-  const api = requiredString(body.api, "api", 100);
-  if (!supportedProtocols().includes(api)) throw new ApiFault(400, "INVALID_FIELD", "不支持此模型 API 协议");
+  const api = requiredString(body.api, "api", 100).trim();
+  const nativeMode = NATIVE_PROVIDER_MODES.find((item) => item.api === api);
+  if (nativeMode && providerId !== nativeMode.provider) {
+    throw new ApiFault(400, "INVALID_FIELD", "原生 Gemini 模式必须使用 DSH 的 google 提供商");
+  }
+  if (!nativeMode && !supportedProtocols().includes(api)) {
+    throw new ApiFault(400, "INVALID_FIELD", "不支持此模型 API 协议");
+  }
   const models = parseProviderModels(body.models);
-  const displayName = optionalString(body.displayName, 200)?.trim();
+  if (nativeMode) {
+    let catalog: unknown[];
+    try {
+      catalog = await llm.discoverModels("llm-pi-ai", { provider: nativeMode.provider });
+    } catch {
+      throw new ApiFault(503, "NATIVE_MODEL_CATALOG_UNAVAILABLE", "DSH 的 Gemini 模型目录当前不可用");
+    }
+    const catalogIds = new Set(catalog.flatMap((item) =>
+      isObject(item) && typeof item.id === "string" ? [item.id] : []));
+    if (models.some((model) => typeof model.id !== "string" || !catalogIds.has(model.id))) {
+      throw new ApiFault(400, "NATIVE_MODEL_NOT_IN_CATALOG", "原生 Gemini 只能使用当前 DSH 模型目录中的模型");
+    }
+  }
+  const displayName = optionalString(body.displayName, 200)?.trim()
+    || nativeMode?.displayName;
   const apiKey = optionalString(body.apiKey, 8192)?.trim();
   const ns = settings.describe({ redactSecrets: true }).find((item) => item.ns === "llm-pi-ai");
   if (!ns) throw new ApiFault(503, "MODEL_SETTINGS_UNAVAILABLE", "DSH 自定义模型设置当前不可用");
   const current = getPath(ns.value, ["providers", providerId]);
   if (updating && !isObject(current)) throw new ApiFault(404, "PROVIDER_NOT_FOUND", "自定义提供商不存在");
   const existing = isObject(current) ? current : {};
+  const configurableEntry = llm.listConfigurableProviders().find((item) => item.provider === providerId);
+  if (nativeMode && (!configurableEntry || !isNativeCatalogProvider(configurableEntry))) {
+    throw new ApiFault(409, "NATIVE_PROVIDER_UNAVAILABLE", "当前 DSH 没有开放可配置的原生 Google provider");
+  }
   const routeTakenOutsideCustom = llm.listConfigurableProviders().some((item) => item.provider === providerId
-    && !(item.settingsNs === "llm-pi-ai" && item.declared === true))
-    || llm.listProviders().some((item) => item.id === providerId) && current === undefined;
+    && !(item.settingsNs === "llm-pi-ai" && item.declared === true)
+    && !(nativeMode && item.provider === nativeMode.provider && isNativeCatalogProvider(item)))
+    || llm.listProviders().some((item) => item.id === providerId) && current === undefined && !nativeMode;
   if (!updating && routeTakenOutsideCustom) {
     throw new ApiFault(409, "PROVIDER_EXISTS", "此提供商 ID 已被 DSH 使用");
   }
@@ -662,11 +710,13 @@ async function writeCustomProvider(
   if (credentialRef !== undefined && !validCredentialRef(credentialRef)) {
     throw new ApiFault(409, "CREDENTIAL_REF_UNAVAILABLE", "DSH 当前凭据引用格式不可用");
   }
+  const retainedProfile = { ...existing };
+  if (nativeMode) delete retainedProfile.api;
   const profile = {
-    ...existing,
+    ...retainedProfile,
     ...(displayName ? { displayName } : {}),
     ...(credentialRef ? { apiKeyEnv: credentialRef } : {}),
-    api,
+    ...(nativeMode ? {} : { api }),
     baseURL,
     models,
   };
@@ -679,7 +729,13 @@ async function writeCustomProvider(
   const expectedRevision = optionalBodySafeInteger(body.expectedRevision, "expectedRevision") ?? ns.revision;
   if (!sameManagedProviderProfile(existing, profile)) {
     try {
-      await settings.mutate("llm-pi-ai", [{ op: "set", path: ["providers", providerId], value: profile }], expectedRevision);
+      const operations: Array<{ op: "set"; path: string[]; value: unknown } | { op: "unset"; path: string[] }> = [
+        { op: "set", path: ["providers", providerId], value: profile },
+      ];
+      if (nativeMode && typeof existing.api === "string") {
+        operations.push({ op: "unset", path: ["providers", providerId, "api"] });
+      }
+      await settings.mutate("llm-pi-ai", operations, expectedRevision);
     } catch (error: unknown) {
       if (isSettingsConflict(error)) throw new ApiFault(409, "SETTINGS_CONFLICT", "模型设置已被其他窗口修改，请刷新后重试");
       throw new ApiFault(422, "MODEL_SETTINGS_REJECTED", "DSH 拒绝了这组提供商设置，请检查协议、地址和模型 ID");
@@ -707,7 +763,8 @@ async function removeCustomProvider(
     throw new ApiFault(400, "INVALID_FIELD", "自定义提供商 ID 格式无效");
   }
   const entry = llm.listConfigurableProviders().find((item) => item.provider === providerId
-    && item.settingsNs === "llm-pi-ai" && item.declared === true);
+    && item.settingsNs === "llm-pi-ai"
+    && (item.declared === true || isNativeCatalogProvider(item)));
   if (!entry) throw new ApiFault(404, "PROVIDER_NOT_FOUND", "自定义提供商不存在");
   const ns = settings.describe({ redactSecrets: true }).find((item) => item.ns === "llm-pi-ai");
   if (!ns) throw new ApiFault(503, "MODEL_SETTINGS_UNAVAILABLE", "DSH 自定义模型设置当前不可用");
@@ -751,6 +808,12 @@ function parseProviderModels(value: unknown): Array<Record<string, unknown>> {
       ...(maxTokens === undefined ? {} : { maxTokens }),
     };
   });
+}
+
+function isNativeCatalogProvider(entry: ConfigurableProviderLike): boolean {
+  return entry.settingsNs === "llm-pi-ai"
+    && entry.declared === false
+    && NATIVE_PROVIDER_MODES.some((mode) => mode.provider === entry.provider);
 }
 
 function sameManagedProviderProfile(current: Record<string, unknown>, next: Record<string, unknown>): boolean {
