@@ -12,6 +12,7 @@ test("mobile model settings follow DSH settings and write-only credential flows"
   const directory = await mkdtemp(join(tmpdir(), "riko-mobile-model-settings-"));
   const tokenPath = join(directory, "bridge-token");
   const registryPath = join(directory, "session-registry.json");
+  const accountStorePath = join(directory, "accounts.json");
   await writeFile(tokenPath, bridgeToken, { mode: 0o600 });
 
   const state = {
@@ -102,7 +103,26 @@ test("mobile model settings follow DSH settings and write-only credential flows"
         return () => { handler = undefined; };
       },
     },
-    sessionController: {},
+    sessionController: {
+      createdSessions: new Set(),
+      async list() {
+        return { items: [...this.createdSessions].map((sessionId) => ({ sessionId, updatedAt: 1, running: false, blank: false })) };
+      },
+      async create({ sessionId, agentPreset }) {
+        this.createdSessions.add(sessionId);
+        return { sessionId, agentPreset };
+      },
+      async modelCatalog() {
+        return {
+          groups: Object.entries(state.namespace.value.providers).map(([id, profile]) => ({
+            id,
+            name: profile.displayName ?? id,
+            models: profile.models ?? [],
+          })),
+        };
+      },
+      async selectModel(request) { return request; },
+    },
     settings,
     credentials,
     llm,
@@ -111,15 +131,20 @@ test("mobile model settings follow DSH settings and write-only credential flows"
   };
 
   try {
-    apply(ctx, { apiTokenFile: tokenPath, sessionRegistryFile: registryPath });
+    apply(ctx, {
+      apiTokenFile: tokenPath,
+      sessionRegistryFile: registryPath,
+      accountStoreFile: accountStorePath,
+      allowedProviderHosts: ["alice.example"],
+    });
     await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
     const address = server.address();
     const base = `http://127.0.0.1:${address.port}/riko-app-api/v1`;
-    const request = async (path, method = "GET", body) => {
+    const request = async (path, method = "GET", body, token = bridgeToken) => {
       const response = await fetch(`${base}${path}`, {
         method,
         headers: {
-          authorization: `Bearer ${bridgeToken}`,
+          authorization: `Bearer ${token}`,
           ...(body === undefined ? {} : { "content-type": "application/json" }),
         },
         ...(body === undefined ? {} : { body: JSON.stringify(body) }),
@@ -166,6 +191,69 @@ test("mobile model settings follow DSH settings and write-only credential flows"
     assert.equal(retryCreate.status, 200);
     assert.equal(state.namespace.value.providers["acme-gateway"].apiKeyEnv, "ACME_GATEWAY_API_KEY");
     assert.equal(state.credentials.get("ACME_GATEWAY_API_KEY"), "fake-acme-key-never-returned");
+
+    const alice = await request("/auth/register", "POST", {
+      username: "alice",
+      password: "correct horse battery staple",
+    });
+    assert.equal(alice.status, 201);
+    const aliceToken = alice.body.accessToken;
+    assert.equal((await request("/model-settings/custom-providers", "POST", {
+      provider: "internal-probe",
+      displayName: "Internal probe",
+      baseURL: "http://127.0.0.1:8080/internal",
+      api: "openai-completions",
+      apiKey: "unused",
+      models: [{ id: "probe" }],
+    }, aliceToken)).status, 400);
+    const aliceProvider = await request("/model-settings/custom-providers", "POST", {
+      provider: "personal-gateway",
+      displayName: "Alice Gateway",
+      baseURL: "https://alice.example/v1",
+      api: "openai-responses",
+      apiKey: "alice-only-secret-key",
+      models: [{ id: "alice-model" }],
+    }, aliceToken);
+    assert.equal(aliceProvider.status, 200);
+    assert.equal(JSON.stringify(aliceProvider.body).includes("alice-only-secret-key"), false);
+    const aliceSettings = await request("/model-settings", "GET", undefined, aliceToken);
+    assert.equal(aliceSettings.status, 200);
+    assert.deepEqual(aliceSettings.body.providers.filter((item) => item.custom).map((item) => item.id), ["personal-gateway"]);
+    assert.equal(aliceSettings.body.canDiscover, false);
+    assert.equal(JSON.stringify(aliceSettings.body).includes("alice-only-secret-key"), false);
+    assert.equal((await request("/model-settings/discover", "POST", {
+      baseURL: "http://127.0.0.1:8080/internal",
+      api: "openai-completions",
+    }, aliceToken)).status, 403);
+    assert.equal((await request("/model-settings/providers/openai/credential", "POST", {
+      apiKey: "should-not-write-global-key",
+    }, aliceToken)).status, 403);
+
+    const bob = await request("/auth/register", "POST", {
+      username: "bob",
+      password: "another correct horse battery",
+    });
+    assert.equal(bob.status, 201);
+    const bobSettings = await request("/model-settings", "GET", undefined, bob.body.accessToken);
+    assert.deepEqual(bobSettings.body.providers.filter((item) => item.custom).map((item) => item.id), []);
+    assert.equal((await request("/model-settings/custom-providers/personal-gateway", "DELETE", undefined, bob.body.accessToken)).status, 404);
+
+    const aliceModels = await request("/models", "GET", undefined, aliceToken);
+    assert.equal(aliceModels.body.groups.some((item) => item.id === "acme-gateway"), false);
+    assert.equal(aliceModels.body.groups.some((item) => item.id === "riko-u-" + alice.body.account.userId.replaceAll("-", "") + "-personal-gateway"), true);
+    const bobModels = await request("/models", "GET", undefined, bob.body.accessToken);
+    assert.equal(bobModels.body.groups.some((item) => item.id.includes("personal-gateway")), false);
+
+    const aliceSession = await request("/sessions", "POST", { requestId: "22222222-2222-4222-8222-222222222222" }, aliceToken);
+    const bobSession = await request("/sessions", "POST", { requestId: "33333333-3333-4333-8333-333333333333" }, bob.body.accessToken);
+    const crossAccountModel = await request(
+      `/sessions/${bobSession.body.sessionId}/model`,
+      "POST",
+      { provider: "riko-u-" + alice.body.account.userId.replaceAll("-", "") + "-personal-gateway", model: "alice-model" },
+      bob.body.accessToken,
+    );
+    assert.equal(crossAccountModel.status, 404);
+    assert.equal((await request(`/sessions/${aliceSession.body.sessionId}/history`, "GET", undefined, bob.body.accessToken)).status, 404);
   } finally {
     await new Promise((resolve) => server.close(resolve));
     await rm(directory, { recursive: true, force: true });

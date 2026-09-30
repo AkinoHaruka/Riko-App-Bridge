@@ -1,7 +1,9 @@
 - insert:
     - id: riko-app-api
       name: '@riko/riko-app-api'
-      disabled: !!js "!(process.env.RIKO_APP_API_TOKEN_FILE && process.env.RIKO_APP_SESSION_REGISTRY_FILE)"
+      disabled: !!js "!(process.env.RIKO_APP_API_TOKEN_FILE && process.env.RIKO_APP_SESSION_REGISTRY_FILE && process.env.RIKO_APP_ACCOUNT_STORE_FILE)"
       config:
         apiTokenFile: !!js process.env.RIKO_APP_API_TOKEN_FILE
         sessionRegistryFile: !!js process.env.RIKO_APP_SESSION_REGISTRY_FILE
+        accountStoreFile: !!js process.env.RIKO_APP_ACCOUNT_STORE_FILE
+        allowedProviderHosts: !!js process.env.RIKO_APP_ALLOWED_PROVIDER_HOSTS

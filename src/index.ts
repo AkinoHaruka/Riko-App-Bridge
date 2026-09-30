@@ -1,6 +1,7 @@
-import { timingSafeEqual, randomUUID } from "node:crypto";
+import { createHash, randomBytes, scrypt as scryptCallback, timingSafeEqual, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { isIP } from "node:net";
 import { dirname } from "node:path";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { supportedProtocols } from "@deepseek-ai/dsh-llm-pi-ai";
@@ -17,6 +18,12 @@ const NATIVE_PROVIDER_MODES = [{
   displayName: "Gemini",
   baseURL: "https://generativelanguage.googleapis.com/v1beta",
 }] as const;
+const DEFAULT_ACCOUNT_PROVIDER_HOSTS = [
+  "api.openai.com", "api.anthropic.com", "api.deepseek.com", "openrouter.ai",
+  "api.siliconflow.cn", "api.moonshot.cn", "api.moonshot.ai", "dashscope.aliyuncs.com",
+  "generativelanguage.googleapis.com", "api.minimax.chat", "api.minimax.io", "api.z.ai",
+  "open.bigmodel.cn", "api.together.xyz", "api.groq.com", "api.x.ai",
+];
 
 export const name = "riko-app-api";
 export const inject = ["webServer", "sessionController", "settings", "credentials", "llm"];
@@ -24,6 +31,8 @@ export const inject = ["webServer", "sessionController", "settings", "credential
 export interface Config {
   apiTokenFile: string;
   sessionRegistryFile: string;
+  accountStoreFile: string;
+  allowedProviderHosts?: string[];
 }
 
 interface MessageValue {
@@ -133,10 +142,150 @@ interface MobileContext {
   logger?: { warn(message: string): void; error(message: string): void; info(message: string): void };
 }
 
-interface RegistryState {
+interface AccountRecord {
+  id: string;
+  username: string;
+  passwordSalt: string;
+  passwordHash: string;
+  createdAt: number;
+}
+
+interface AccountTokenRecord {
+  tokenHash: string;
+  userId: string;
+  createdAt: number;
+  revokedAt?: number;
+}
+
+interface AccountStoreState {
   version: 1;
+  accounts: AccountRecord[];
+  tokens: AccountTokenRecord[];
+}
+
+interface RegistryUserState {
   sessions: string[];
   createRequests: Record<string, string>;
+}
+
+interface RegistryState {
+  version: 2;
+  users: Record<string, RegistryUserState>;
+  legacy: RegistryUserState;
+}
+
+type RequestPrincipal = "admin" | {
+  kind: "account";
+  userId: string;
+  username: string;
+  tokenHash: string;
+};
+
+/** Account passwords use scrypt; bearer tokens and passwords are never persisted in plaintext. */
+class AccountStore {
+  private tail: Promise<void> = Promise.resolve();
+
+  private constructor(private readonly path: string, private state: AccountStoreState) {}
+
+  static async open(path: string): Promise<AccountStore> {
+    let state: AccountStoreState;
+    try {
+      const raw: unknown = JSON.parse(await readFile(path, "utf8"));
+      if (!isAccountStoreState(raw)) throw new Error("unsupported account store shape");
+      state = raw;
+    } catch (error: unknown) {
+      if (isNodeError(error) && error.code === "ENOENT") {
+        state = { version: 1, accounts: [], tokens: [] };
+      } else {
+        throw new Error(`riko-app-api: cannot read account store: ${errorMessage(error)}`);
+      }
+    }
+    return new AccountStore(path, state);
+  }
+
+  async register(username: string, password: string): Promise<{ account: AccountRecord; token: string }> {
+    const normalized = normalizeUsername(username);
+    validatePassword(password);
+    const passwordSalt = randomBytes(16).toString("hex");
+    const passwordHash = (await derivePassword(password, passwordSalt)).toString("hex");
+    return this.update((next) => {
+      if (next.accounts.some((item) => item.username === normalized)) {
+        throw new ApiFault(409, "ACCOUNT_EXISTS", "这个用户名已被注册");
+      }
+      const account: AccountRecord = {
+        id: randomUUID(), username: normalized, passwordSalt, passwordHash, createdAt: Date.now(),
+      };
+      const token = randomBytes(32).toString("base64url");
+      next.accounts.push(account);
+      next.tokens.push({ tokenHash: hashSecret(token), userId: account.id, createdAt: Date.now() });
+      return { account, token };
+    });
+  }
+
+  async login(username: string, password: string): Promise<{ account: AccountRecord; token: string }> {
+    const normalized = normalizeUsername(username);
+    validatePassword(password, { allowShort: true });
+    const account = this.state.accounts.find((item) => item.username === normalized);
+    const salt = account?.passwordSalt ?? "riko-account-login-dummy-salt";
+    const expected = account?.passwordHash ?? DUMMY_PASSWORD_HASH;
+    const actual = (await derivePassword(password, salt)).toString("hex");
+    if (!account || !equalHash(actual, expected)) {
+      throw new ApiFault(401, "INVALID_CREDENTIALS", "用户名或密码不正确");
+    }
+    const token = randomBytes(32).toString("base64url");
+    await this.update((next) => {
+      next.tokens.push({ tokenHash: hashSecret(token), userId: account.id, createdAt: Date.now() });
+    });
+    return { account, token };
+  }
+
+  authenticate(token: string): RequestPrincipal | undefined {
+    const tokenHash = hashSecret(token);
+    const record = this.state.tokens.find((item) => !item.revokedAt && equalHash(tokenHash, item.tokenHash));
+    const account = record && this.state.accounts.find((item) => item.id === record.userId);
+    return record && account ? { kind: "account", userId: account.id, username: account.username, tokenHash } : undefined;
+  }
+
+  async revoke(tokenHash: string): Promise<void> {
+    await this.update((next) => {
+      const token = next.tokens.find((item) => !item.revokedAt && equalHash(tokenHash, item.tokenHash));
+      if (token) token.revokedAt = Date.now();
+    });
+  }
+
+  private async update<T>(work: (next: AccountStoreState) => Promise<T> | T): Promise<T> {
+    let release!: () => void;
+    const previous = this.tail;
+    this.tail = new Promise<void>((resolve) => { release = resolve; });
+    await previous;
+    try {
+      const next = structuredClone(this.state);
+      const result = await work(next);
+      await this.persist(next);
+      this.state = next;
+      return result;
+    } finally {
+      release();
+    }
+  }
+
+  private async persist(state: AccountStoreState): Promise<void> {
+    await mkdir(dirname(this.path), { recursive: true });
+    const temporary = `${this.path}.${process.pid}.${randomUUID()}.tmp`;
+    await writeFile(temporary, `${JSON.stringify(state)}\n`, { encoding: "utf8", mode: 0o600 });
+    await rename(temporary, this.path);
+  }
+}
+
+const DUMMY_PASSWORD_HASH = "0".repeat(128);
+
+function derivePassword(password: string, salt: string): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    scryptCallback(password, salt, 64, { N: 1 << 15, r: 8, p: 1, maxmem: 64 * 1024 * 1024 }, (error, key) => {
+      if (error) reject(error);
+      else resolve(key as Buffer);
+    });
+  });
 }
 
 class SessionRegistry {
@@ -148,59 +297,79 @@ class SessionRegistry {
     let state: RegistryState;
     try {
       const raw: unknown = JSON.parse(await readFile(path, "utf8"));
-      if (!isRegistryState(raw)) throw new Error("unsupported session registry shape");
-      state = raw;
+      if (isRegistryState(raw)) state = raw;
+      else if (isLegacyRegistryState(raw)) {
+        // Old global sessions are deliberately kept in the admin-only legacy bucket.
+        state = { version: 2, users: {}, legacy: { sessions: raw.sessions, createRequests: raw.createRequests } };
+      } else throw new Error("unsupported session registry shape");
     } catch (error: unknown) {
       if (isNodeError(error) && error.code === "ENOENT") {
-        state = { version: 1, sessions: [], createRequests: {} };
+        state = { version: 2, users: {}, legacy: { sessions: [], createRequests: {} } };
       } else {
         throw new Error(`riko-app-api: cannot read session registry: ${errorMessage(error)}`);
       }
     }
-    return new SessionRegistry(path, state);
+    const registry = new SessionRegistry(path, state);
+    if (state.version === 2) await registry.persist();
+    return registry;
   }
 
-  list(): readonly string[] {
-    return [...this.state.sessions];
+  list(principal: RequestPrincipal): readonly string[] {
+    if (principal === "admin") {
+      return [...new Set([...this.state.legacy.sessions, ...Object.values(this.state.users).flatMap((item) => item.sessions)])];
+    }
+    return [...(this.state.users[principal.userId]?.sessions ?? [])];
   }
 
-  includes(sessionId: string): boolean {
-    return this.state.sessions.includes(sessionId);
+  includes(sessionId: string, principal: RequestPrincipal): boolean {
+    if (principal === "admin") return this.state.legacy.sessions.includes(sessionId)
+      || Object.values(this.state.users).some((item) => item.sessions.includes(sessionId));
+    return this.state.users[principal.userId]?.sessions.includes(sessionId) ?? false;
   }
 
-  async reserveCreate(requestId: string): Promise<string> {
-    return this.update(async () => {
-      if (Object.hasOwn(this.state.createRequests, requestId)) return this.state.createRequests[requestId]!;
+  async reserveCreate(principal: RequestPrincipal, requestId: string): Promise<string> {
+    const owner = principal === "admin" ? "admin" : principal.userId;
+    return this.update(async (next) => {
+      const bucket = next.users[owner] ??= { sessions: [], createRequests: {} };
+      if (Object.hasOwn(bucket.createRequests, requestId)) return bucket.createRequests[requestId]!;
       const sessionId = randomUUID();
-      this.state.createRequests[requestId] = sessionId;
-      await this.persist();
+      bucket.createRequests[requestId] = sessionId;
       return sessionId;
     });
   }
 
-  async commitCreate(sessionId: string): Promise<void> {
-    await this.update(async () => {
-      if (!this.state.sessions.includes(sessionId)) this.state.sessions.push(sessionId);
-      await this.persist();
+  async commitCreate(principal: RequestPrincipal, sessionId: string): Promise<void> {
+    const owner = principal === "admin" ? "admin" : principal.userId;
+    await this.update(async (next) => {
+      const bucket = next.users[owner] ??= { sessions: [], createRequests: {} };
+      if (!bucket.sessions.includes(sessionId)) bucket.sessions.push(sessionId);
     });
   }
 
-  private async update<T>(work: () => Promise<T>): Promise<T> {
+  private async update<T>(work: (next: RegistryState) => Promise<T> | T): Promise<T> {
     let release!: () => void;
     const previous = this.tail;
     this.tail = new Promise<void>((resolve) => { release = resolve; });
     await previous;
     try {
-      return await work();
+      const next = structuredClone(this.state);
+      const result = await work(next);
+      await this.persistState(next);
+      this.state = next;
+      return result;
     } finally {
       release();
     }
   }
 
   private async persist(): Promise<void> {
+    await this.persistState(this.state);
+  }
+
+  private async persistState(state: RegistryState): Promise<void> {
     await mkdir(dirname(this.path), { recursive: true });
     const temporary = `${this.path}.${process.pid}.${randomUUID()}.tmp`;
-    await writeFile(temporary, `${JSON.stringify(this.state)}\n`, { encoding: "utf8", mode: 0o600 });
+    await writeFile(temporary, `${JSON.stringify(state)}\n`, { encoding: "utf8", mode: 0o600 });
     await rename(temporary, this.path);
   }
 }
@@ -216,26 +385,36 @@ export function apply(ctx: MobileContext, rawConfig: Config): void {
   const apiToken = readFileSync(config.apiTokenFile, "utf8").trim();
   if (apiToken.length < 32) throw new Error("riko-app-api: token file must contain at least 32 characters");
   const mobileCtx = ctx;
+  const limiter = new AuthRateLimiter();
   const registryPromise = SessionRegistry.open(config.sessionRegistryFile).catch((error: unknown) => {
     mobileCtx.logger?.error(`riko-app-api: session registry unavailable: ${errorMessage(error)}`);
     throw new ApiFault(503, "REGISTRY_UNAVAILABLE", "Riko session registry is unavailable");
   });
-  // Keep an initialization failure handled even when no request arrives to await it.
   void registryPromise.catch(() => undefined);
+  const accountStorePromise = AccountStore.open(config.accountStoreFile).catch((error: unknown) => {
+      mobileCtx.logger?.error(`riko-app-api: account store unavailable: ${errorMessage(error)}`);
+      throw new ApiFault(503, "ACCOUNT_STORE_UNAVAILABLE", "Riko account service is unavailable");
+    })
+  void accountStorePromise.catch(() => undefined);
 
   mobileCtx.effect(() => mobileCtx.webServer.register({
     kind: "prefix",
     path: API_PREFIX,
     handler: async (req, res) => {
       try {
-        if (!authorized(req, apiToken)) throw new ApiFault(401, "UNAUTHORIZED", "Authentication required");
+        const sessions = mobileCtx.sessionController;
         const url = new URL(req.url ?? "/", "http://riko-app.local");
         const route = url.pathname.slice(API_PREFIX.length) || "/";
+        const accountStore = await accountStorePromise;
+        const publicRoute = route === "/health" && req.method === "GET"
+          || (route === "/auth/register" || route === "/auth/login") && req.method === "POST";
+        const principal = publicRoute ? undefined : authenticate(req, apiToken, accountStore);
+        if (!publicRoute && !principal) throw new ApiFault(401, "UNAUTHORIZED", "请先登录 Riko 账号");
         const registry = await registryPromise;
-        const sessions = mobileCtx.sessionController;
         await dispatch(
           req, res, route, url, sessions, registry,
-          mobileCtx.settings, mobileCtx.credentials, mobileCtx.llm,
+          mobileCtx.settings, mobileCtx.credentials, mobileCtx.llm, accountStore, limiter,
+          config.allowedProviderHosts ?? DEFAULT_ACCOUNT_PROVIDER_HOSTS, principal, req,
         );
       } catch (error: unknown) {
         if (res.headersSent) {
@@ -253,7 +432,7 @@ export function apply(ctx: MobileContext, rawConfig: Config): void {
     },
   }));
 
-  mobileCtx.logger?.info?.(`riko-app-api: mounted ${API_PREFIX} for the Riko preset`);
+  mobileCtx.logger?.info?.(`riko-app-api: mounted ${API_PREFIX} with open account registration`);
 }
 
 async function dispatch(
@@ -266,20 +445,61 @@ async function dispatch(
   settings: SettingsControllerLike,
   credentials: CredentialControllerLike,
   llm: LlmRegistryLike,
+  accountStore: AccountStore,
+  limiter: AuthRateLimiter,
+  allowedProviderHosts: readonly string[],
+  principal: RequestPrincipal | undefined,
+  request: IncomingMessage,
 ): Promise<void> {
+  if (route === "/auth/register" && req.method === "POST") {
+    limiter.consume(`register:${clientAddress(request)}`, 8, 60 * 60 * 1000);
+    const body = await readJson(req);
+    const username = normalizeUsername(requiredString(body.username, "username", 32));
+    limiter.consume(`register-name:${username}`, 3, 60 * 60 * 1000);
+    const password = requiredPassword(body.password);
+    const created = await accountStore.register(username, password);
+    sendJson(res, 201, authResponse(created.account, created.token));
+    return;
+  }
+  if (route === "/auth/login" && req.method === "POST") {
+    limiter.consume(`login:${clientAddress(request)}`, 20, 15 * 60 * 1000);
+    const body = await readJson(req);
+    const username = normalizeUsername(requiredString(body.username, "username", 32));
+    limiter.consume(`login-name:${username}`, 8, 15 * 60 * 1000);
+    const password = requiredPassword(body.password, true);
+    const loggedIn = await accountStore.login(username, password);
+    sendJson(res, 200, authResponse(loggedIn.account, loggedIn.token));
+    return;
+  }
   if (route === "/health" && req.method === "GET") {
     sendJson(res, 200, { ok: true, dshVersion: DSH_VERSION, preset: PRESET_ID });
     return;
   }
+  if (route === "/auth/me" && req.method === "GET") {
+    const account = requireAccount(principal);
+    sendJson(res, 200, { userId: account.userId, username: account.username });
+    return;
+  }
+  if (route === "/auth/logout" && req.method === "POST") {
+    const account = requireAccount(principal);
+    await accountStore.revoke(account.tokenHash);
+    sendJson(res, 200, { loggedOut: true });
+    return;
+  }
   if (route === "/models" && req.method === "GET") {
-    sendJson(res, 200, await sessions.modelCatalog());
+    const catalog = await sessions.modelCatalog();
+    sendJson(res, 200, principal === undefined || principal === "admin"
+      ? catalog : filterAccountModelCatalog(catalog, principal.userId, llm.listConfigurableProviders()));
     return;
   }
   if (route === "/model-settings" && req.method === "GET") {
-    sendJson(res, 200, await describeModelSettings(settings, credentials, llm));
+    const described = await describeModelSettings(settings, credentials, llm);
+    sendJson(res, 200, principal === undefined || principal === "admin"
+      ? described : filterAccountModelSettings(described, principal.userId));
     return;
   }
   if (route === "/model-settings/discover" && req.method === "POST") {
+    requireAdmin(principal);
     const body = await readJson(req);
     const api = requiredString(body.api, "api", 100);
     const nativeMode = NATIVE_PROVIDER_MODES.find((item) => item.api === api);
@@ -317,6 +537,7 @@ async function dispatch(
   }
   const credentialMatch = /^\/model-settings\/providers\/([^/]+)\/credential$/.exec(route);
   if (credentialMatch && (req.method === "POST" || req.method === "DELETE")) {
+    requireAdmin(principal);
     const providerId = decodePathPart(credentialMatch[1]!);
     const reference = await providerCredentialRef(providerId, settings, llm);
     if (req.method === "POST") {
@@ -348,15 +569,27 @@ async function dispatch(
   }
   if (route === "/model-settings/custom-providers" && req.method === "POST") {
     const body = await readJson(req);
-    await writeCustomProvider(body, undefined, settings, credentials, llm, false);
-    sendJson(res, 200, { saved: true });
+    if (principal && principal !== "admin") {
+      assertAccountProviderUrl(requiredString(body.baseURL, "baseURL", 2048), allowedProviderHosts);
+    }
+    const providerId = principal && principal !== "admin"
+      ? accountProviderId(principal.userId, requiredString(body.provider, "provider", 100))
+      : undefined;
+    await writeCustomProvider(body, providerId, settings, credentials, llm, false);
+    sendJson(res, 200, { saved: true, ...(providerId ? { provider: requiredString(body.provider, "provider", 100) } : {}) });
     return;
   }
   const customProviderMatch = /^\/model-settings\/custom-providers\/([^/]+)$/.exec(route);
   if (customProviderMatch) {
-    const providerId = decodePathPart(customProviderMatch[1]!);
+    const requestedProviderId = decodePathPart(customProviderMatch[1]!);
+    const providerId = principal && principal !== "admin"
+      ? accountProviderId(principal.userId, requestedProviderId)
+      : requestedProviderId;
     if (req.method === "PUT") {
       const body = await readJson(req);
+      if (principal && principal !== "admin") {
+        assertAccountProviderUrl(requiredString(body.baseURL, "baseURL", 2048), allowedProviderHosts);
+      }
       await writeCustomProvider(body, providerId, settings, credentials, llm, true);
       sendJson(res, 200, { saved: true, provider: providerId });
       return;
@@ -368,7 +601,8 @@ async function dispatch(
     }
   }
   if (route === "/sessions" && req.method === "GET") {
-    const allowed = new Set(registry.list());
+    const effectivePrincipal = requirePrincipal(principal);
+    const allowed = new Set(registry.list(effectivePrincipal));
     const result = await sessions.list({}, new AbortController().signal);
     sendJson(res, 200, {
       items: result.items.filter((item) => allowed.has(item.sessionId)),
@@ -376,22 +610,24 @@ async function dispatch(
     return;
   }
   if (route === "/sessions" && req.method === "POST") {
+    const effectivePrincipal = requirePrincipal(principal);
     const body = await readJson(req);
     const requestId = requiredUuid(body.requestId, "requestId");
-    const sessionId = await registry.reserveCreate(requestId);
+    const sessionId = await registry.reserveCreate(effectivePrincipal, requestId);
     const created = await sessions.create({ sessionId, agentPreset: PRESET_ID });
     if (created.sessionId !== sessionId || created.agentPreset !== PRESET_ID) {
       throw new ApiFault(409, "PRESET_MISMATCH", "DSH did not create the requested Riko preset session");
     }
-    await registry.commitCreate(sessionId);
+    await registry.commitCreate(effectivePrincipal, sessionId);
     sendJson(res, 201, { sessionId, agentPreset: PRESET_ID });
     return;
   }
 
   const match = /^\/sessions\/([^/]+)(?:\/(history|events|messages|model|cancel))?$/.exec(route);
   if (!match) throw new ApiFault(404, "NOT_FOUND", "Route not found");
+  const effectivePrincipal = requirePrincipal(principal);
   const sessionId = decodePathPart(match[1]!);
-  if (!registry.includes(sessionId)) throw new ApiFault(404, "NOT_FOUND", "Riko-App session not found");
+  if (!registry.includes(sessionId, effectivePrincipal)) throw new ApiFault(404, "NOT_FOUND", "Riko-App session not found");
   const action = match[2];
 
   if (action === "history" && req.method === "GET") {
@@ -448,6 +684,9 @@ async function dispatch(
     return;
   }
   if (action === "messages" && req.method === "POST") {
+    if (effectivePrincipal !== "admin") {
+      limiter.consume(`chat:${effectivePrincipal.userId}`, 12, 60 * 1000);
+    }
     const body = await readJson(req);
     const requestId = requiredUuid(body.requestId, "requestId");
     const text = requiredString(body.text, "text", 100_000);
@@ -467,6 +706,15 @@ async function dispatch(
   if (action === "model" && req.method === "POST") {
     const body = await readJson(req);
     const provider = requiredString(body.provider, "provider", 200);
+    if (effectivePrincipal !== "admin") {
+      const ownPrefix = accountProviderPrefix(effectivePrincipal.userId);
+      const configuredProvider = llm.listConfigurableProviders().find((item) => item.provider === provider);
+      if (isAccountProviderId(provider) && !provider.startsWith(ownPrefix)
+        || configuredProvider?.settingsNs === "llm-pi-ai" && configuredProvider.declared === true
+          && !provider.startsWith(ownPrefix)) {
+        throw new ApiFault(404, "PROVIDER_NOT_FOUND", "模型提供商不存在");
+      }
+    }
     const model = requiredString(body.model, "model", 300);
     const reasoningEffort = optionalString(body.reasoningEffort, 100);
     const selected = await sessions.selectModel({
@@ -573,10 +821,75 @@ async function describeModelSettings(
     writable: settings.writable,
     revision: piNamespace?.revision ?? 0,
     protocols: supportedProtocols(),
+    canDiscover: true,
     nativeProviders: NATIVE_PROVIDER_MODES.filter((mode) =>
       directory.some((entry) => entry.provider === mode.provider && isNativeCatalogProvider(entry))),
     providers,
   };
+}
+
+function accountProviderPrefix(userId: string): string {
+  return `riko-u-${userId.replaceAll("-", "")}-`;
+}
+
+function assertAccountProviderUrl(value: string, allowedHosts: readonly string[]): void {
+  let url: URL;
+  try { url = new URL(value.trim()); } catch {
+    throw new ApiFault(400, "INVALID_FIELD", "API 地址格式无效");
+  }
+  const hostname = url.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  const approved = allowedHosts.some((host) => hostname === host || hostname.endsWith(`.${host}`));
+  if (url.protocol !== "https:" || url.username || url.password || (url.port && url.port !== "443")
+    || isIP(hostname) !== 0 || !approved
+    || hostname === "localhost" || hostname.endsWith(".localhost")
+    || hostname.endsWith(".local") || hostname.endsWith(".internal")) {
+    throw new ApiFault(400, "PROVIDER_HOST_NOT_ALLOWED", "账号自定义 API 仅支持 HTTPS 和服务器批准的公开域名");
+  }
+}
+
+function accountProviderId(userId: string, aliasValue: string): string {
+  const alias = aliasValue.trim();
+  if (!/^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/.test(alias)
+    || /^riko-u-[a-f0-9]{32}-/.test(alias)) {
+    throw new ApiFault(400, "INVALID_FIELD", "自定义提供商 ID 格式无效");
+  }
+  return `${accountProviderPrefix(userId)}${alias}`;
+}
+
+function isAccountProviderId(value: string): boolean {
+  return /^riko-u-[a-f0-9]{32}-[a-z0-9-]+$/.test(value);
+}
+
+function filterAccountModelCatalog(value: unknown, userId: string, configurable: readonly ConfigurableProviderLike[]): unknown {
+  if (!isObject(value) || !Array.isArray(value.groups)) return value;
+  const ownPrefix = accountProviderPrefix(userId);
+  const customProviderIds = new Set(configurable
+    .filter((entry) => entry.settingsNs === "llm-pi-ai" && entry.declared === true)
+    .map((entry) => entry.provider));
+  return {
+    ...value,
+    groups: value.groups.filter((group) => isObject(group) && typeof group.id === "string"
+      && (!customProviderIds.has(group.id) || group.id.startsWith(ownPrefix))
+      && (!isAccountProviderId(group.id) || group.id.startsWith(ownPrefix))),
+  };
+}
+
+function filterAccountModelSettings(value: Record<string, unknown>, userId: string): Record<string, unknown> {
+  const ownPrefix = accountProviderPrefix(userId);
+  const providers = Array.isArray(value.providers) ? value.providers.flatMap((raw) => {
+    if (!isObject(raw) || typeof raw.id !== "string") return [];
+    const ownProvider = raw.id.startsWith(ownPrefix);
+    if (isAccountProviderId(raw.id) && !ownProvider) return [];
+    if (raw.custom === true && !ownProvider) return [];
+    const profile = isObject(raw.profile) ? { ...raw.profile, apiKeyEnv: undefined } : raw.profile;
+    return [{
+      ...raw,
+      id: ownProvider ? raw.id.slice(ownPrefix.length) : raw.id,
+      credentialRef: undefined,
+      profile,
+    }];
+  }) : [];
+  return { ...value, providers, nativeProviders: [], canDiscover: false };
 }
 
 function projectProviderProfile(value: unknown): {
@@ -992,12 +1305,115 @@ function compactStreamText(value: unknown): string {
   }).join("");
 }
 
-function authorized(req: IncomingMessage, expected: string): boolean {
+function authenticate(req: IncomingMessage, expected: string, accountStore: AccountStore): RequestPrincipal | undefined {
   const header = req.headers.authorization;
-  if (typeof header !== "string" || !header.startsWith("Bearer ")) return false;
-  const supplied = Buffer.from(header.slice(7));
-  const secret = Buffer.from(expected);
-  return supplied.length === secret.length && timingSafeEqual(supplied, secret);
+  if (typeof header !== "string" || !header.startsWith("Bearer ")) return undefined;
+  const supplied = header.slice(7);
+  if (equalSecret(supplied, expected)) return "admin";
+  return accountStore.authenticate(supplied);
+}
+
+function requireAdmin(principal: RequestPrincipal | undefined): void {
+  if (principal !== "admin") throw new ApiFault(403, "ADMIN_REQUIRED", "此操作仅限服务器管理员");
+}
+
+function requireAccount(principal: RequestPrincipal | undefined): Exclude<RequestPrincipal, "admin"> {
+  if (!principal || principal === "admin") {
+    throw new ApiFault(401, "ACCOUNT_LOGIN_REQUIRED", "请使用 Riko 账号登录");
+  }
+  return principal;
+}
+
+function requirePrincipal(principal: RequestPrincipal | undefined): RequestPrincipal {
+  if (!principal) throw new ApiFault(401, "UNAUTHORIZED", "请先登录 Riko 账号");
+  return principal;
+}
+
+function authResponse(account: AccountRecord, token: string): Record<string, unknown> {
+  return {
+    accessToken: token,
+    account: { userId: account.id, username: account.username },
+  };
+}
+
+function normalizeUsername(value: string): string {
+  const normalized = value.trim().toLowerCase();
+  if (!/^[a-z0-9][a-z0-9_.-]{2,31}$/.test(normalized)) {
+    throw new ApiFault(400, "INVALID_USERNAME", "用户名需为 3–32 位字母、数字、点、下划线或短横线");
+  }
+  return normalized;
+}
+
+function requiredPassword(value: unknown, allowShort = false): string {
+  if (typeof value !== "string" || value.length > 128 || Buffer.byteLength(value, "utf8") > 256
+    || (!allowShort && value.length < 10) || value.length === 0) {
+    throw new ApiFault(400, "INVALID_PASSWORD", allowShort
+      ? "密码格式无效"
+      : "密码至少 10 位，最多 128 位");
+  }
+  return value;
+}
+
+function validatePassword(value: string, options: { allowShort?: boolean } = {}): void {
+  requiredPassword(value, options.allowShort ?? false);
+}
+
+function clientAddress(req: IncomingMessage): string {
+  const realIp = req.headers["x-real-ip"];
+  if (typeof realIp === "string" && realIp.length <= 64 && /^[0-9a-f:.]+$/i.test(realIp.trim())) {
+    return realIp.trim();
+  }
+  return req.socket.remoteAddress ?? "unknown";
+}
+
+class AuthRateLimiter {
+  private readonly attempts = new Map<string, number[]>();
+
+  consume(key: string, limit: number, windowMs: number): void {
+    const now = Date.now();
+    const current = (this.attempts.get(key) ?? []).filter((timestamp) => now - timestamp < windowMs);
+    if (current.length >= limit) {
+      const retryAfter = Math.max(1, Math.ceil((windowMs - (now - current[0]!)) / 1000));
+      throw new ApiFault(429, "RATE_LIMITED", `请求过于频繁，请在 ${retryAfter} 秒后重试`);
+    }
+    current.push(now);
+    this.attempts.set(key, current);
+    if (this.attempts.size > 10_000) {
+      for (const [entry, timestamps] of this.attempts) {
+        if (timestamps.every((timestamp) => now - timestamp > 60 * 60 * 1000)) this.attempts.delete(entry);
+      }
+    }
+  }
+}
+
+function hashSecret(value: string): string {
+  return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+function equalHash(left: string, right: string): boolean {
+  const a = Buffer.from(left, "hex");
+  const b = Buffer.from(right, "hex");
+  return a.length === b.length && a.length > 0 && timingSafeEqual(a, b);
+}
+
+function equalSecret(left: string, right: string): boolean {
+  const a = Buffer.from(left);
+  const b = Buffer.from(right);
+  return a.length === b.length && a.length > 0 && timingSafeEqual(a, b);
+}
+
+function isAccountStoreState(value: unknown): value is AccountStoreState {
+  return isObject(value) && value.version === 1 && Array.isArray(value.accounts) && Array.isArray(value.tokens)
+    && value.accounts.every((item) => isObject(item)
+      && typeof item.id === "string" && typeof item.username === "string"
+      && /^[a-z0-9][a-z0-9_.-]{2,31}$/.test(item.username)
+      && typeof item.passwordSalt === "string" && /^[0-9a-f]{32}$/.test(item.passwordSalt)
+      && typeof item.passwordHash === "string" && /^[0-9a-f]{128}$/.test(item.passwordHash)
+      && Number.isSafeInteger(item.createdAt))
+    && value.tokens.every((item) => isObject(item)
+      && typeof item.tokenHash === "string" && /^[0-9a-f]{64}$/.test(item.tokenHash)
+      && typeof item.userId === "string" && Number.isSafeInteger(item.createdAt)
+      && (item.revokedAt === undefined || Number.isSafeInteger(item.revokedAt)));
 }
 
 async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
@@ -1062,10 +1478,30 @@ function decodePathPart(value: string): string {
 
 function validateConfig(value: Config): Config {
   if (!value || typeof value.apiTokenFile !== "string" || !value.apiTokenFile.trim()
-    || typeof value.sessionRegistryFile !== "string" || !value.sessionRegistryFile.trim()) {
-    throw new Error("riko-app-api: apiTokenFile and sessionRegistryFile are required");
+    || typeof value.sessionRegistryFile !== "string" || !value.sessionRegistryFile.trim()
+    || typeof value.accountStoreFile !== "string" || !value.accountStoreFile.trim()) {
+    throw new Error("riko-app-api: apiTokenFile, sessionRegistryFile and accountStoreFile are required");
   }
-  return { apiTokenFile: value.apiTokenFile.trim(), sessionRegistryFile: value.sessionRegistryFile.trim() };
+  return {
+    apiTokenFile: value.apiTokenFile.trim(),
+    sessionRegistryFile: value.sessionRegistryFile.trim(),
+    accountStoreFile: value.accountStoreFile.trim(),
+    allowedProviderHosts: parseAllowedProviderHosts(value.allowedProviderHosts),
+  };
+}
+
+function parseAllowedProviderHosts(value: unknown): string[] {
+  const configured = typeof value === "string"
+    ? value.split(",")
+    : Array.isArray(value) ? value : [];
+  const hosts = [...DEFAULT_ACCOUNT_PROVIDER_HOSTS, ...configured]
+    .filter((item): item is string => typeof item === "string")
+    .map((item) => item.trim().toLowerCase().replace(/^\.+|\.+$/g, ""))
+    .filter(Boolean);
+  if (hosts.some((host) => !/^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/.test(host))) {
+    throw new Error("riko-app-api: allowedProviderHosts must contain DNS host names only");
+  }
+  return [...new Set(hosts)];
 }
 
 function sendJson(res: ServerResponse, status: number, value: unknown): void {
@@ -1102,6 +1538,15 @@ function earliestRecordSeq(records: readonly unknown[]): number | null {
 }
 
 function isRegistryState(value: unknown): value is RegistryState {
+  const validBucket = (bucket: unknown): bucket is RegistryUserState => isObject(bucket)
+    && Array.isArray(bucket.sessions) && bucket.sessions.every((item) => typeof item === "string")
+    && isObject(bucket.createRequests)
+    && Object.values(bucket.createRequests).every((item) => typeof item === "string");
+  return isObject(value) && value.version === 2 && isObject(value.users)
+    && Object.values(value.users).every(validBucket) && validBucket(value.legacy);
+}
+
+function isLegacyRegistryState(value: unknown): value is { version: 1; sessions: string[]; createRequests: Record<string, string> } {
   return isObject(value) && value.version === 1 && Array.isArray(value.sessions)
     && value.sessions.every((item) => typeof item === "string") && isObject(value.createRequests)
     && Object.values(value.createRequests).every((item) => typeof item === "string");

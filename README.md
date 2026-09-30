@@ -1,6 +1,6 @@
 # Riko App API Bridge for DSH
 
-`@riko/riko-app-api` is a standalone DeepSeek Harness Host plugin for the Riko Android app. It owns the `/riko-app-api/v1` HTTP API, Riko-App session registry, and DSH-backed model settings. It is separate from `@agent-memory/dsh-adapter`; both packages can be installed in the same DSH profile.
+`@riko/riko-app-api` is a standalone DeepSeek Harness Host plugin for the Riko Android app. It owns `/riko-app-api/v1`, account authentication, per-account session ownership, and account-scoped custom model providers. It does not modify the Riko Memory adapter.
 
 ## Install
 
@@ -10,35 +10,34 @@ From this repository checkout:
 corepack pnpm dsh plugin --profile <profile> add .
 ```
 
-After this package is published to the repository's default branch, install it from GitHub with:
-
-```text
-corepack pnpm dsh plugin --profile <profile> add github:AkinoHaruka/Riko-App-Bridge
-```
-
-The bundle inserts a profile-level Host plugin. It does not modify the Riko Memory adapter or its preset patch. The plugin remains disabled until both required environment variables are configured in the DSH process or its home `.env` file:
+The profile patch keeps the plugin disabled until all required environment variables are configured:
 
 | Variable | Purpose |
 |---|---|
-| `RIKO_APP_API_TOKEN_FILE` | Path to a random app-only bearer token file. Keep it outside Git and the package. |
-| `RIKO_APP_SESSION_REGISTRY_FILE` | Path to the persistent registry of sessions created through this bridge. |
+| `RIKO_APP_API_TOKEN_FILE` | Server-only administrator bearer token file. Never put it in the app. |
+| `RIKO_APP_SESSION_REGISTRY_FILE` | Persistent account-to-DSH-session ownership registry. |
+| `RIKO_APP_ACCOUNT_STORE_FILE` | Persistent account records, scrypt password hashes, and hashed access tokens. |
+| `RIKO_APP_ALLOWED_PROVIDER_HOSTS` | Optional comma-separated extra DNS hosts that account-owned custom providers may use. Built-in public provider hosts are allowed by default. |
 
-## API and credentials
+Store all three files on persistent storage outside the plugin package. The plugin writes them atomically and creates new files with owner-only permissions where supported.
 
-Riko-App uses `https://riko.asia/riko-app-api/v1` by default; the URL remains editable in App settings. Put the DSH listener behind the existing HTTPS reverse proxy and route `/riko-app-api/` to it while preserving the URI prefix. Keep DSH bound to loopback.
+## Accounts and access
 
-The bridge token is separate from provider API keys. It authorizes only bridge operations and is stored encrypted by Android Keystore in the app. Provider credentials stay on the DSH host and are written through DSH `credentials`; the bridge never returns credential values.
+Registration is open. Users register with a 3–32 character username and a password of at least 10 characters. Passwords are stored as scrypt hashes; opaque bearer tokens are returned once, stored by Android in Android Keystore, and stored on the server only as SHA-256 hashes. Registration and login have per-address and per-username throttles.
 
-The bridge exposes health, model catalog and selection, Riko-App session list/create/history, prompt submission, live event stream, cancellation, and model settings:
+Every session created through an account is owned by that account. Session listing, history, streaming, model selection, prompt submission, and cancellation verify that ownership. Old sessions from the previous single-token bridge remain in an admin-only legacy bucket and are never assigned to the first registrant. The server-only administrator token remains available for operator access and global DSH configuration.
 
-- `GET /model-settings` returns provider profiles, the DSH settings revision, and credential configured/not-configured flags.
-- `POST /model-settings/discover` calls DSH `llm.discoverModels` for a compatible provider endpoint. Native Gemini reads the model catalog bundled with the installed DSH; it does not call Google's model-list API.
-- `POST|DELETE /model-settings/providers/{id}/credential` writes or removes a provider credential.
-- `POST /model-settings/custom-providers` and `PUT|DELETE /model-settings/custom-providers/{id}` manage custom OpenAI/Anthropic-compatible providers and the DSH-native Google/Gemini provider. Native Gemini is saved under provider ID `google` with the profile `api` omitted, so DSH keeps its catalog-native `google-generative-ai` implementation. Only model IDs present in the installed DSH Google catalog are accepted. Provider credentials are stored separately through DSH `credentials`.
+App users can add custom API providers. The bridge stores them in DSH under an account-specific provider ID and credential reference, filters other accounts' providers from the app catalog, and rejects cross-account provider selection. Account-owned providers require HTTPS, use the built-in public-provider host allowlist, and cannot target IP literals, arbitrary hosts, or nonstandard ports. An administrator can add approved DNS host names through `RIKO_APP_ALLOWED_PROVIDER_HOSTS`. Normal accounts cannot read or change global provider credentials/settings. Model discovery is admin-only because it makes a server-side request to a caller-provided URL; users can enter model IDs manually. The DSH listener must remain behind the existing HTTPS reverse proxy and bound to loopback.
 
-New sessions use the `riko` Agent preset. The registry prevents this API from addressing unrelated DSH sessions. History returns 20 messages by default and permits up to 50 per page.
+The Riko Memory adapter is a separate service boundary. Do not enable it for public app accounts until its memory principal is mapped to the authenticated app account; a single static memory token would make accounts share memories.
 
-Never place the token or provider API keys in the profile patch, logs, documentation, or repository.
+## API surface
+
+- Public: `GET /health`, `POST /auth/register`, `POST /auth/login`.
+- Authenticated account: `GET /auth/me`, `POST /auth/logout`, model catalog, account-scoped custom model providers, and owned session operations.
+- Server administrator token: account-independent DSH model settings and legacy/session operator access.
+
+Provider credential values and account password hashes are never returned by the API. Responses use `Cache-Control: no-store`.
 
 ## Development
 
@@ -47,4 +46,4 @@ npm install
 npm test
 ```
 
-The package targets DSH `0.2.0-rc.1`. Local TypeScript tests exercise bridge API behavior with fixed in-process DSH service doubles; they do not establish production deployment or external model connectivity.
+The package targets DSH `0.2.0-rc.1` APIs. Tests use local service doubles and synthetic accounts; they do not prove production deployment or external model connectivity.

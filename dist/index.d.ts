@@ -4,6 +4,8 @@ export declare const inject: string[];
 export interface Config {
     apiTokenFile: string;
     sessionRegistryFile: string;
+    accountStoreFile: string;
+    allowedProviderHosts?: string[];
 }
 interface SessionControllerLike {
     list(request: Record<string, never>, signal: AbortSignal): Promise<{
