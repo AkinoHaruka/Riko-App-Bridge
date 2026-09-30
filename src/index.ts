@@ -454,7 +454,7 @@ async function dispatch(
   if (route === "/auth/register" && req.method === "POST") {
     limiter.consume(`register:${clientAddress(request)}`, 8, 60 * 60 * 1000);
     const body = await readJson(req);
-    const username = normalizeUsername(requiredString(body.username, "username", 32));
+    const username = normalizeUsername(requiredString(body.username, "username", 512));
     limiter.consume(`register-name:${username}`, 3, 60 * 60 * 1000);
     const password = requiredPassword(body.password);
     const created = await accountStore.register(username, password);
@@ -464,7 +464,7 @@ async function dispatch(
   if (route === "/auth/login" && req.method === "POST") {
     limiter.consume(`login:${clientAddress(request)}`, 20, 15 * 60 * 1000);
     const body = await readJson(req);
-    const username = normalizeUsername(requiredString(body.username, "username", 32));
+    const username = normalizeUsername(requiredString(body.username, "username", 512));
     limiter.consume(`login-name:${username}`, 8, 15 * 60 * 1000);
     const password = requiredPassword(body.password, true);
     const loggedIn = await accountStore.login(username, password);
@@ -1337,11 +1337,19 @@ function authResponse(account: AccountRecord, token: string): Record<string, unk
 }
 
 function normalizeUsername(value: string): string {
-  const normalized = value.trim().toLowerCase();
-  if (!/^[a-z0-9][a-z0-9_.-]{2,31}$/.test(normalized)) {
-    throw new ApiFault(400, "INVALID_USERNAME", "用户名需为 3–32 位字母、数字、点、下划线或短横线");
+  const normalized = value.normalize("NFC").trim().toLowerCase();
+  if (!isValidNormalizedUsername(normalized)) {
+    throw new ApiFault(400, "INVALID_USERNAME", "用户名不能为空，最多 128 个字符，且不能包含控制字符或双向格式控制符");
   }
   return normalized;
+}
+
+function isValidNormalizedUsername(value: string): boolean {
+  const codePointLength = Array.from(value).length;
+  return value.length > 0
+    && codePointLength <= 128
+    && Buffer.byteLength(value, "utf8") <= 512
+    && !/[\p{Cc}\p{Cs}\u061c\u200e\u200f\u202a-\u202e\u2066-\u206f]/u.test(value);
 }
 
 function requiredPassword(value: unknown, allowShort = false): string {
@@ -1406,7 +1414,8 @@ function isAccountStoreState(value: unknown): value is AccountStoreState {
   return isObject(value) && value.version === 1 && Array.isArray(value.accounts) && Array.isArray(value.tokens)
     && value.accounts.every((item) => isObject(item)
       && typeof item.id === "string" && typeof item.username === "string"
-      && /^[a-z0-9][a-z0-9_.-]{2,31}$/.test(item.username)
+      && item.username === item.username.normalize("NFC").trim().toLowerCase()
+      && isValidNormalizedUsername(item.username)
       && typeof item.passwordSalt === "string" && /^[0-9a-f]{32}$/.test(item.passwordSalt)
       && typeof item.passwordHash === "string" && /^[0-9a-f]{128}$/.test(item.passwordHash)
       && Number.isSafeInteger(item.createdAt))

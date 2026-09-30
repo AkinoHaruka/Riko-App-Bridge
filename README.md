@@ -23,7 +23,7 @@ Store all three files on persistent storage outside the plugin package. The plug
 
 ## Accounts and access
 
-Registration is open. Users register with a 3–32 character username and a password of at least 10 characters. Passwords are stored as scrypt hashes; opaque bearer tokens are returned once, stored by Android in Android Keystore, and stored on the server only as SHA-256 hashes. Registration and login have per-address and per-username throttles.
+Registration is open. Usernames accept Unicode text, spaces, and punctuation; leading/trailing whitespace is trimmed and names are normalized to lowercase. A username must contain 1–128 Unicode characters and cannot contain control characters. Passwords must contain at least 10 characters. Passwords are stored as scrypt hashes; opaque bearer tokens are returned once, stored by Android in Android Keystore, and stored on the server only as SHA-256 hashes. Registration and login have per-address and per-username throttles.
 
 Every session created through an account is owned by that account. Session listing, history, streaming, model selection, prompt submission, and cancellation verify that ownership. Old sessions from the previous single-token bridge remain in an admin-only legacy bucket and are never assigned to the first registrant. The server-only administrator token remains available for operator access and global DSH configuration.
 

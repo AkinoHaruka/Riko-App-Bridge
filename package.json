@@ -1,6 +1,6 @@
 {
   "name": "@riko/riko-app-api",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Riko App HTTP bridge plugin for DeepSeek Harness",
   "repository": {
     "type": "git",
