@@ -23,19 +23,20 @@ Store all three files on persistent storage outside the plugin package. The plug
 
 ## Accounts and access
 
-Registration is open. Usernames accept Unicode text, spaces, and punctuation; leading/trailing whitespace is trimmed and names are normalized to lowercase. A username must contain 1–128 Unicode characters and cannot contain control characters. Passwords must contain at least 10 characters. Passwords are stored as scrypt hashes; opaque bearer tokens are returned once, stored by Android in Android Keystore, and stored on the server only as SHA-256 hashes. Registration and login have per-address and per-username throttles.
+Registration is open. Usernames accept Unicode text, spaces, and punctuation; leading/trailing whitespace is trimmed and names are normalized to lowercase. A username must contain 1–128 Unicode characters and cannot contain control or bidirectional formatting characters. Passwords must contain at least 10 characters. Passwords are stored as scrypt hashes; opaque bearer tokens are returned once, stored by Android in Android Keystore, and stored on the server only as SHA-256 hashes. Registration and login have per-address and per-username throttles. Every public registration is forced to the `user` role; request fields cannot grant privileges.
 
-Every session created through an account is owned by that account. Session listing, history, streaming, model selection, prompt submission, and cancellation verify that ownership. Old sessions from the previous single-token bridge remain in an admin-only legacy bucket and are never assigned to the first registrant. The server-only administrator token remains available for operator access and global DSH configuration.
+Every session created through an account is owned by that account. Session listing, history, streaming, model selection, prompt submission, and cancellation verify that ownership. An operator may promote an account to `admin`; admin accounts can manage shared model providers and API credentials. Regular accounts can manage only their own private custom providers. Account admins still see and control only their own sessions. Old sessions from the previous single-token bridge remain in a server-token-only legacy bucket and are never assigned to the first registrant. The server-only administrator token remains available for operator access.
 
-App users can add custom API providers. The bridge stores them in DSH under an account-specific provider ID and credential reference, filters other accounts' providers from the app catalog, and rejects cross-account provider selection. Account-owned providers require HTTPS, use the built-in public-provider host allowlist, and cannot target IP literals, arbitrary hosts, or nonstandard ports. An administrator can add approved DNS host names through `RIKO_APP_ALLOWED_PROVIDER_HOSTS`. Normal accounts cannot read or change global provider credentials/settings. Model discovery is admin-only because it makes a server-side request to a caller-provided URL; users can enter model IDs manually. The DSH listener must remain behind the existing HTTPS reverse proxy and bound to loopback.
+Regular app accounts can add custom API providers scoped to their own account. Admin accounts can add shared providers used by all accounts and manage global provider credentials/settings. Secret values are write-only and never returned by the API. Account-owned providers require HTTPS, use the built-in public-provider host allowlist, and cannot target IP literals, arbitrary hosts, or nonstandard ports. An administrator can add approved DNS host names through `RIKO_APP_ALLOWED_PROVIDER_HOSTS`. Model discovery is admin-only because it makes a server-side request to a caller-provided URL; regular users can enter model IDs manually. The DSH listener must remain behind the existing HTTPS reverse proxy and bound to loopback.
 
 The Riko Memory adapter is a separate service boundary. Do not enable it for public app accounts until its memory principal is mapped to the authenticated app account; a single static memory token would make accounts share memories.
 
 ## API surface
 
 - Public: `GET /health`, `POST /auth/register`, `POST /auth/login`.
-- Authenticated account: `GET /auth/me`, `POST /auth/logout`, model catalog, account-scoped custom model providers, and owned session operations.
-- Server administrator token: account-independent DSH model settings and legacy/session operator access.
+- Authenticated account: `GET /auth/me` returns the server-assigned role; `POST /auth/logout`, model catalog, private custom model providers, and owned session operations.
+- Admin account: shared model settings, provider discovery, and provider credential changes; session operations remain account-scoped.
+- Server administrator token: global DSH model settings and legacy/session operator access.
 
 Provider credential values and account password hashes are never returned by the API. Responses use `Cache-Control: no-store`.
 

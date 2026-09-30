@@ -61,7 +61,7 @@ class AccountStore {
                 throw new ApiFault(409, "ACCOUNT_EXISTS", "这个用户名已被注册");
             }
             const account = {
-                id: randomUUID(), username: normalized, passwordSalt, passwordHash, createdAt: Date.now(),
+                id: randomUUID(), username: normalized, role: "user", passwordSalt, passwordHash, createdAt: Date.now(),
             };
             const token = randomBytes(32).toString("base64url");
             next.accounts.push(account);
@@ -89,7 +89,13 @@ class AccountStore {
         const tokenHash = hashSecret(token);
         const record = this.state.tokens.find((item) => !item.revokedAt && equalHash(tokenHash, item.tokenHash));
         const account = record && this.state.accounts.find((item) => item.id === record.userId);
-        return record && account ? { kind: "account", userId: account.id, username: account.username, tokenHash } : undefined;
+        return record && account ? {
+            kind: "account",
+            userId: account.id,
+            username: account.username,
+            role: account.role ?? "user",
+            tokenHash,
+        } : undefined;
     }
     async revoke(tokenHash) {
         await this.update((next) => {
@@ -311,7 +317,7 @@ async function dispatch(req, res, route, url, sessions, registry, settings, cred
     }
     if (route === "/auth/me" && req.method === "GET") {
         const account = requireAccount(principal);
-        sendJson(res, 200, { userId: account.userId, username: account.username });
+        sendJson(res, 200, { userId: account.userId, username: account.username, role: account.role });
         return;
     }
     if (route === "/auth/logout" && req.method === "POST") {
@@ -323,13 +329,19 @@ async function dispatch(req, res, route, url, sessions, registry, settings, cred
     if (route === "/models" && req.method === "GET") {
         const catalog = await sessions.modelCatalog();
         sendJson(res, 200, principal === undefined || principal === "admin"
-            ? catalog : filterAccountModelCatalog(catalog, principal.userId, llm.listConfigurableProviders()));
+            ? catalog
+            : isAdministratorPrincipal(principal)
+                ? filterAdminModelCatalog(catalog)
+                : filterAccountModelCatalog(catalog, principal.userId, llm.listConfigurableProviders()));
         return;
     }
     if (route === "/model-settings" && req.method === "GET") {
         const described = await describeModelSettings(settings, credentials, llm);
         sendJson(res, 200, principal === undefined || principal === "admin"
-            ? described : filterAccountModelSettings(described, principal.userId));
+            ? described
+            : isAdministratorPrincipal(principal)
+                ? filterAdminModelSettings(described)
+                : filterAccountModelSettings(described, principal.userId));
         return;
     }
     if (route === "/model-settings/discover" && req.method === "POST") {
@@ -403,11 +415,13 @@ async function dispatch(req, res, route, url, sessions, registry, settings, cred
     }
     if (route === "/model-settings/custom-providers" && req.method === "POST") {
         const body = await readJson(req);
-        if (principal && principal !== "admin") {
+        const administrator = isAdministratorPrincipal(principal);
+        if (principal && !administrator) {
             assertAccountProviderUrl(requiredString(body.baseURL, "baseURL", 2048), allowedProviderHosts);
         }
-        const providerId = principal && principal !== "admin"
-            ? accountProviderId(principal.userId, requiredString(body.provider, "provider", 100))
+        const accountUserId = principal !== undefined && principal !== "admin" ? principal.userId : undefined;
+        const providerId = accountUserId !== undefined && !administrator
+            ? accountProviderId(accountUserId, requiredString(body.provider, "provider", 100))
             : undefined;
         await writeCustomProvider(body, providerId, settings, credentials, llm, false);
         sendJson(res, 200, { saved: true, ...(providerId ? { provider: requiredString(body.provider, "provider", 100) } : {}) });
@@ -416,12 +430,17 @@ async function dispatch(req, res, route, url, sessions, registry, settings, cred
     const customProviderMatch = /^\/model-settings\/custom-providers\/([^/]+)$/.exec(route);
     if (customProviderMatch) {
         const requestedProviderId = decodePathPart(customProviderMatch[1]);
-        const providerId = principal && principal !== "admin"
-            ? accountProviderId(principal.userId, requestedProviderId)
+        const administrator = isAdministratorPrincipal(principal);
+        if (administrator && principal !== "admin" && isAccountProviderId(requestedProviderId)) {
+            throw new ApiFault(404, "PROVIDER_NOT_FOUND", "共享模型提供商不存在");
+        }
+        const accountUserId = principal !== undefined && principal !== "admin" ? principal.userId : undefined;
+        const providerId = accountUserId !== undefined && !administrator
+            ? accountProviderId(accountUserId, requestedProviderId)
             : requestedProviderId;
         if (req.method === "PUT") {
             const body = await readJson(req);
-            if (principal && principal !== "admin") {
+            if (principal && !administrator) {
                 assertAccountProviderUrl(requiredString(body.baseURL, "baseURL", 2048), allowedProviderHosts);
             }
             await writeCustomProvider(body, providerId, settings, credentials, llm, true);
@@ -542,8 +561,9 @@ async function dispatch(req, res, route, url, sessions, registry, settings, cred
     if (action === "model" && req.method === "POST") {
         const body = await readJson(req);
         const provider = requiredString(body.provider, "provider", 200);
-        if (effectivePrincipal !== "admin") {
-            const ownPrefix = accountProviderPrefix(effectivePrincipal.userId);
+        const accountUserId = effectivePrincipal === "admin" ? undefined : effectivePrincipal.userId;
+        if (!isAdministratorPrincipal(effectivePrincipal) && accountUserId !== undefined) {
+            const ownPrefix = accountProviderPrefix(accountUserId);
             const configuredProvider = llm.listConfigurableProviders().find((item) => item.provider === provider);
             if (isAccountProviderId(provider) && !provider.startsWith(ownPrefix)
                 || configuredProvider?.settingsNs === "llm-pi-ai" && configuredProvider.declared === true
@@ -696,6 +716,24 @@ function filterAccountModelCatalog(value, userId, configurable) {
             && (!isAccountProviderId(group.id) || group.id.startsWith(ownPrefix))),
     };
 }
+function filterAdminModelCatalog(value) {
+    if (!isObject(value) || !Array.isArray(value.groups))
+        return value;
+    return {
+        ...value,
+        groups: value.groups.filter((group) => !isObject(group)
+            || typeof group.id !== "string"
+            || !isAccountProviderId(group.id)),
+    };
+}
+function filterAdminModelSettings(value) {
+    const providers = Array.isArray(value.providers)
+        ? value.providers.filter((provider) => !isObject(provider)
+            || typeof provider.id !== "string"
+            || !isAccountProviderId(provider.id))
+        : [];
+    return { ...value, providers };
+}
 function filterAccountModelSettings(value, userId) {
     const ownPrefix = accountProviderPrefix(userId);
     const providers = Array.isArray(value.providers) ? value.providers.flatMap((raw) => {
@@ -775,6 +813,9 @@ async function writeCustomProvider(body, pathProviderId, settings, credentials, 
     const providerId = pathProviderId ?? requiredString(body.provider, "provider", 100).trim();
     if (!/^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/.test(providerId)) {
         throw new ApiFault(400, "INVALID_FIELD", "自定义提供商 ID 格式无效");
+    }
+    if (pathProviderId === undefined && isAccountProviderId(providerId)) {
+        throw new ApiFault(400, "INVALID_FIELD", "共享提供商 ID 不能使用账号私有命名空间");
     }
     const baseURL = requiredString(body.baseURL, "baseURL", 2048).trim();
     let parsedURL;
@@ -1141,8 +1182,11 @@ function authenticate(req, expected, accountStore) {
     return accountStore.authenticate(supplied);
 }
 function requireAdmin(principal) {
-    if (principal !== "admin")
-        throw new ApiFault(403, "ADMIN_REQUIRED", "此操作仅限服务器管理员");
+    if (!isAdministratorPrincipal(principal))
+        throw new ApiFault(403, "ADMIN_REQUIRED", "此操作仅限管理员账号");
+}
+function isAdministratorPrincipal(principal) {
+    return principal === "admin" || (principal !== undefined && principal.role === "admin");
 }
 function requireAccount(principal) {
     if (!principal || principal === "admin") {
@@ -1158,7 +1202,7 @@ function requirePrincipal(principal) {
 function authResponse(account, token) {
     return {
         accessToken: token,
-        account: { userId: account.id, username: account.username },
+        account: { userId: account.id, username: account.username, role: account.role ?? "user" },
     };
 }
 function normalizeUsername(value) {
@@ -1232,6 +1276,7 @@ function isAccountStoreState(value) {
             && typeof item.id === "string" && typeof item.username === "string"
             && item.username === item.username.normalize("NFC").trim().toLowerCase()
             && isValidNormalizedUsername(item.username)
+            && (item.role === undefined || item.role === "user" || item.role === "admin")
             && typeof item.passwordSalt === "string" && /^[0-9a-f]{32}$/.test(item.passwordSalt)
             && typeof item.passwordHash === "string" && /^[0-9a-f]{128}$/.test(item.passwordHash)
             && Number.isSafeInteger(item.createdAt))
